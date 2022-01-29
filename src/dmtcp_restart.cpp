@@ -57,7 +57,8 @@ using namespace dmtcp;
 // string has at least one format specifier with corresponding format argument.
 // Ubuntu 9.01 uses -Wformat=2 by default.
 static const char *theUsage =
-  "Usage: dmtcp_restart [OPTIONS] <ckpt1.dmtcp> [ckpt2.dmtcp...]\n\n"
+  "Usage:       dmtcp_restart [OPTIONS] <ckpt1.dmtcp> [ckpt2.dmtcp...]\n"
+  "Usage (MPI): dmtcp_restart [OPTIONS] --restartdir [DIR w/ ckpt_rank_*/ ]\n\n"
   "Restart processes from a checkpoint image.\n\n"
   "Connecting to the DMTCP Coordinator:\n"
   "  -h, --coord-host HOSTNAME (environment variable DMTCP_COORD_HOST)\n"
@@ -101,6 +102,8 @@ static const char *theUsage =
   "  --ckptdir (environment variable DMTCP_CHECKPOINT_DIR):\n"
   "              Directory to store checkpoint images\n"
   "              (default: use the same dir used in previous checkpoint)\n"
+  "  --restartdir Directory that contains checkpoint image directories\n"
+  "  --mpi       Use as MPI proxy (default: no MPI proxy)\n"
   "  --tmpdir PATH (environment variable DMTCP_TMPDIR)\n"
   "              Directory to store temp files (default: $TMDPIR or /tmp)\n"
   "  -q, --quiet (or set environment variable DMTCP_QUIET = 0, 1, or 2)\n"
@@ -118,6 +121,7 @@ static const char *theUsage =
   "\n";
 
 static int requestedDebugLevel = 0;
+static bool runMpiProxy = 0;
 
 class RestoreTarget;
 
@@ -147,6 +151,7 @@ static void runMtcpRestart(int fd, ProcessInfo *pInfo);
 static int readCkptHeader(const string &path, ProcessInfo *pInfo);
 static int openCkptFileToRead(const string &path);
 static int processCkptImages();
+static int processMpiProxy();
 
 class RestoreTarget
 {
@@ -778,7 +783,7 @@ main(int argc, char **argv)
 
   // process args
   shift;
-  while (true) {
+  while (argc > 0) { // ... -restartdir ./ OR ... ckptImg
     string s = argc > 0 ? argv[0] : "--help";
     if (s == "--help" && argc == 1) {
       printf("%s", theUsage);
@@ -835,9 +840,15 @@ main(int argc, char **argv)
     } else if (argc > 1 && (s == "-t" || s == "--tmpdir")) {
       tmpdir_arg = argv[1];
       shift; shift;
+    } else if (argc > 1 && (s == "-r" || s == "--restartdir")) {
+      restartDir = string(argv[1]);
+      shift; shift;
     } else if (argc > 1 && (s == "--gdb")) {
       requestedDebugLevel = atoi(argv[1]);
       shift; shift;
+    } else if (s == "--mpi") {
+      runMpiProxy = true;
+      shift;
     } else if (s == "-q" || s == "--quiet") {
       *getenv(ENV_VAR_QUIET) = *getenv(ENV_VAR_QUIET) + 1;
 
@@ -852,7 +863,7 @@ main(int argc, char **argv)
       shift;
       break;
     } else {
-      break;
+      break; // argv[0] is first ckpt file to be restored; finish parsing later
     }
   }
 
@@ -913,14 +924,104 @@ main(int argc, char **argv)
   }
 
   // Can't specify ckpt images with --restart-dir flag.
-  if (ckptImages.size() == 0) {
+  if (restartDir.empty() ^ ckptImages.size() > 0) {
     JASSERT_STDERR << theUsage;
     exit(DMTCP_FAIL_RC);
   }
 
   CoordinatorAPI::getCoordHostAndPort(allowedModes, &coord_host, &coord_port);
 
+  if (runMpiProxy) {
+    return processMpiProxy();
+  }
+
   return processCkptImages();
+}
+
+static int
+processMpiProxy()
+{
+  string image_zero;
+  char ckptImage[PATH_MAX];
+
+  FILE *fp = tmpfile();
+  int fd = fileno(fp);
+  string fdStr = jalib::XToString(fd);
+
+  JASSERT(fp != NULL);
+
+  // Connect with coordinator using the first checkpoint image in the list
+  // Also, create the DMTCP shared-memory area.
+  WorkerState::setCurrentState(WorkerState::RESTARTING);
+
+  if(restartDir.empty()) {
+    JASSERT(ckptImages.size() > 0);
+    for (const string& image : ckptImages) {
+      memset(ckptImage, 0, PATH_MAX);
+      JASSERT(Util::writeAll(fd, image.c_str(), PATH_MAX) == PATH_MAX);
+    }
+
+    image_zero = ckptImages[0];
+  } else {
+    char *rankDirPrefix = "ckpt_rank_";
+    int rankOffset = strlen(rankDirPrefix);
+
+    vector<string> dirs = jalib::Filesystem::Ls(restartDir);
+    for (const string &dir : dirs) {
+      if (Util::strStartsWith(dir.c_str(), rankDirPrefix)) {
+        vector<string> files = jalib::Filesystem::Ls(restartDir + "/" + dir);
+
+        for (const string& file : files) {
+          if (Util::strStartsWith(file.c_str(), "ckpt") &&
+              Util::strEndsWith(file.c_str(), ".dmtcp")) {
+            int rank = jalib::StringToInt(&dir[rankOffset]);
+            snprintf(ckptImage, 4096, "%s/%s/%s",
+                     restartDir.c_str(), dir.c_str(), file.c_str());
+
+            memset(ckptImage, 0, PATH_MAX);
+            JASSERT(lseek(fd, PATH_MAX * rank, SEEK_SET) == PATH_MAX * rank)
+              (JASSERT_ERRNO);
+            JASSERT(Util::writeAll(fd, ckptImage, PATH_MAX) == PATH_MAX);
+
+            if (rank == 0) {
+              image_zero = ckptImage;
+            }
+
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  JASSERT(!image_zero.empty()).Text("Failed to locate first checkpoint file!");
+
+  // read dmtcp files off underlying filesystem
+  RestoreTarget *t = new RestoreTarget(image_zero);
+  t->initialize();
+
+  vector<char *> mtcpArgs = getMtcpArgs();
+  mtcpArgs.push_back("--ckptListFd");
+  mtcpArgs.push_back((char *)fdStr.c_str());
+
+  const map<string, string> &kvmap = t->getKeyValueMap();
+
+  mtcpArgs.push_back("--minLibsStart");
+  mtcpArgs.push_back((char*) kvmap.at("MANA_MinLibsStart").c_str());
+
+  mtcpArgs.push_back("--maxLibsEnd");
+  mtcpArgs.push_back((char*) kvmap.at("MANA_MaxLibsEnd").c_str());
+
+  mtcpArgs.push_back("--minHighMemStart");
+  mtcpArgs.push_back((char*) kvmap.at("MANA_MinHighMemStart").c_str());
+
+  mtcpArgs.push_back((char *) "--mpi");
+
+  mtcpArgs.push_back(NULL);
+  execvp(mtcpArgs[0], &mtcpArgs[0]);
+  JASSERT(false)(mtcpArgs[0]).Text("execvp failed!");
+
+  return -1;
 }
 
 static int

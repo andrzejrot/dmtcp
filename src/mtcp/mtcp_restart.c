@@ -92,7 +92,8 @@ typedef struct RestoreInfo {
   int stderr_fd;  /* FIXME:  This is never used. */
 
   // int mtcp_sys_errno;
-
+  VA text_addr;
+  size_t text_size;
   VA saved_brk;
   VA restore_addr;
   VA restore_end;
@@ -102,6 +103,9 @@ typedef struct RestoreInfo {
   VA vvarStart;
   VA vvarEnd;
   VA endOfStack;
+  VA minLibsStart;
+  VA maxLibsEnd;
+  VA minHighMemStart;
   fnptr_t post_restart;
   // NOTE: Update the offset when adding fields to the RestoreInfo struct
   // See note below in the restart_fast_path() function.
@@ -116,10 +120,13 @@ typedef struct RestoreInfo {
   // void (*restorememoryareas_fptr)();
   int use_gdb;
   VA mtcp_restart_text_addr;
+  int text_offset;
 #ifdef TIMING
   struct timeval startValue;
 #endif
-  int restart_pause;  // Used by env. var. DMTCP_RESTART_PAUSE
+  int mtcp_restart_pause;  // Used by env. var. DMTCP_RESTART_PAUSE0
+  int ckptListFd;
+  char ckptFileName[PATH_MAX]; // Directory to search for checkpoint files
 } RestoreInfo;
 static RestoreInfo rinfo;
 
@@ -198,6 +205,8 @@ main(int argc, char *argv[], char **environ)
   MtcpHeader mtcpHdr;
   int mtcp_sys_errno;
   int simulate = 0;
+  int runMpiProxy = 0;
+  char *argv0 = argv[0]; // Needed for runMpiProxy
 
   if (argc == 1) {
     MTCP_PRINTF("***ERROR: This program should not be used directly.\n");
@@ -232,11 +241,24 @@ main(int argc, char *argv[], char **environ)
   rinfo.fd = -1;
   rinfo.restart_pause = 0; /* false */
   rinfo.use_gdb = 0;
+  rinfo.text_offset = -1;
+  rinfo.ckptListFd = -1;
+  rinfo.minLibsStart = NULL;
+  rinfo.maxLibsEnd = NULL;
+  rinfo.minHighMemStart = NULL;
+
   shift;
   while (argc > 0) {
     if (mtcp_strcmp(argv[0], "--use-gdb") == 0) {
       rinfo.use_gdb = 1;
       shift;
+    } else if (mtcp_strcmp(argv[0], "--mpi") == 0) {
+      runMpiProxy = 1;
+      shift;
+    } else if (mtcp_strcmp(argv[0], "--text-offset") == 0) {
+      rinfo.text_offset = mtcp_strtol(argv[1]);
+      shift; shift;
+
       // Flags for call by dmtcp_restart follow here:
     } else if (mtcp_strcmp(argv[0], "--fd") == 0) {
       rinfo.fd = mtcp_strtol(argv[1]);
@@ -250,6 +272,18 @@ main(int argc, char *argv[], char **environ)
     } else if (mtcp_strcmp(argv[0], "--simulate") == 0) {
       simulate = 1;
       shift;
+    } else if (mtcp_strcmp(argv[0], "--ckptListFd") == 0) {
+      rinfo.ckptListFd = mtcp_strtol(argv[1]);
+      shift; shift;
+    } else if (mtcp_strcmp(argv[0], "--minLibsStart") == 0) {
+      rinfo.minLibsStart = mtcp_strtol(argv[1]);
+      shift; shift;
+    } else if (mtcp_strcmp(argv[0], "--maxLibsEnd") == 0) {
+      rinfo.maxLibsEnd = mtcp_strtol(argv[1]);
+      shift; shift;
+    } else if (mtcp_strcmp(argv[0], "--minHighMemStart") == 0) {
+      rinfo.minHighMemStart = mtcp_strtol(argv[1]);
+      shift; shift;
     } else if (argc == 1) {
       // We would use MTCP_PRINTF, but it's also for output of util/readdmtcp.sh
       mtcp_printf("Considering '%s' as a ckpt image.\n", argv[0]);
@@ -292,6 +326,14 @@ main(int argc, char *argv[], char **environ)
       MTCP_PRINTF("***ERROR: ckpt image doesn't match MTCP_SIGNATURE\n");
       return 1;  /* exit with error code 1 */
     }
+  }
+
+  DPRINTF("For debugging:\n"
+          "    (gdb) add-symbol-file ../../bin/mtcp_restart %p\n",
+          mtcpHdr.restore_addr + rinfo.text_offset);
+  if (rinfo.text_offset == -1) {
+    DPRINTF("... but add to the above the result, 1 +"
+            " `text_offset.sh mtcp_restart`\n    in the mtcp subdirectory.\n");
   }
 
   if (simulate) {
