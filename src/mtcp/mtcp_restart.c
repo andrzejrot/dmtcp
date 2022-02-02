@@ -318,7 +318,11 @@ main(int argc, char *argv[], char **environ)
     mtcp_abort();
     restart_slow_path();
   } else {
+#ifdef NO_REMAP
+    restorememoryareas(&rinfo);
+#else
     restart_fast_path();
+#endif
   }
   return 0;  /* Will not reach here, but need to satisfy the compiler */
 }
@@ -451,6 +455,7 @@ clear_icache(void *beg, void *end)
 }
 #endif
 
+#ifndef NO_REMAP
 NO_OPTIMIZE
 static void
 restart_fast_path()
@@ -512,6 +517,7 @@ restart_fast_path()
 
   /* NOTREACHED */
 }
+#endif
 
 NO_OPTIMIZE
 static void
@@ -729,6 +735,7 @@ unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
     } else if (mtcp_strcmp(area.name, "[vectors]") == 0) {
       // Do not unmap vectors.  (used in Linux 3.10 on __arm__)
     } else if (area.size > 0) {
+#ifndef NO_REMAP
       DPRINTF("***INFO: munmapping (%p..%p)\n", area.addr, area.endAddr);
       if (mtcp_sys_munmap(area.addr, area.size) == -1) {
         MTCP_PRINTF("***WARNING: %s(%x): munmap(%p, %d) failed; errno: %d\n",
@@ -739,6 +746,7 @@ unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
 
       // Rewind and reread maps.
       mtcp_sys_lseek(mapsfd, 0, SEEK_SET);
+#endif
     }
   }
   mtcp_sys_close(mapsfd);
