@@ -640,6 +640,8 @@ stopthisthread(int signum)
       ThreadList::waitForAllRestored(curThread);
     }
 
+    DMTCP_RESTART_PAUSE(5);
+
     JTRACE("User thread returning to user code")
       (curThread->tid) (__builtin_return_address(0));
   }

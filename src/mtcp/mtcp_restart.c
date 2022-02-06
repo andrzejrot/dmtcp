@@ -38,8 +38,10 @@
  */
 
 #define _GNU_SOURCE 1
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/version.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -60,6 +62,8 @@
 #include "mtcp_util.ic"
 #include "procmapsarea.h"
 
+#include "mtcp_split_process.h"
+
 /* The use of NO_OPTIMIZE is deprecated and will be removed, since we
  * compile mtcp_restart.c with the -O0 flag already.
  */
@@ -74,7 +78,7 @@ void mtcp_check_vdso(char **environ);
 static void mmapfile(int fd, void *buf, size_t size, int prot, int flags);
 #endif
 
-#define BINARY_NAME     "mtcp_restart"
+#define BINARY_NAME     "mtcp_restart-mpi"
 #define BINARY_NAME_M32 "mtcp_restart-32"
 
 /* struct RestoreInfo to pass all parameters from one function to next.
@@ -111,15 +115,9 @@ typedef struct RestoreInfo {
   // See note below in the restart_fast_path() function.
   fnptr_t restorememoryareas_fptr;
 
-  VA old_stack_addr;
-  size_t old_stack_size;
-  VA new_stack_addr;
-  size_t stack_offset;
-
   // void (*post_restart)();
   // void (*restorememoryareas_fptr)();
   int use_gdb;
-  VA mtcp_restart_text_addr;
   int text_offset;
 #ifdef TIMING
   struct timeval startValue;
@@ -133,33 +131,62 @@ static RestoreInfo rinfo;
 /* Internal routines */
 static void readmemoryareas(int fd, VA endOfStack);
 static int read_one_memory_area(int fd, VA endOfStack);
-static void restorememoryareas(RestoreInfo *rinfo_ptr);
+#if 0
+static void adjust_for_smaller_file_size(Area *area, int fd);
+#endif /* if 0 */
+static void restorememoryareas(RestoreInfo *rinfo_ptr,
+                               LowerHalfInfo_t *linfo_ptr);
 static void restore_brk(VA saved_brk, VA restore_begin, VA restore_end);
 static void restart_fast_path(void);
 static void restart_slow_path(void);
 static int doAreasOverlap(VA addr1, size_t size1, VA addr2, size_t size2);
 static int hasOverlappingMapping(VA addr, size_t size);
 static int mremap_move(void *dest, void *src, size_t size);
-static void remapMtcpRestartToReservedArea(RestoreInfo *rinfo);
+static void getTextAddr(VA *textAddr, size_t *size);
 static void mtcp_simulateread(int fd, MtcpHeader *mtcpHdr);
-static void unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo);
+static void unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo,
+                                                LowerHalfInfo_t *lh_info);
 
+// This emulates MAP_FIXED_NOREPLACE, which became available only in Linux 4.17
+// FIXME:  This assume that addr is a multiple of PAGESIZE.  We should
+//         check that in the function, and either issue an error in that
+//         case, or else simulate the action of MAP_FIXED_NOREPLACE.
+void* mmap_fixed_noreplace(void *addr, size_t len, int prot, int flags,
+                         int fd, off_t offset) {
+  int mtcp_sys_errno;  // mtcp_sys_mmap, etc., are macros using this
+  if (flags & MAP_FIXED) {
+    flags ^= MAP_FIXED;
+  }
+  void *addr2 = mtcp_sys_mmap(addr, len, prot, flags, fd, offset);
+  if (addr == addr2) {
+    return addr2;
+  } else if (addr2 != MAP_FAILED) {
+    // undo the mmap
+    mtcp_sys_munmap(addr2, len);
+    mtcp_sys_errno = EEXIST;
+    return MAP_FAILED;
+  } else {
+    // the mmap really did fail
+    return MAP_FAILED;
+  }
+}
 
 #define MB                 1024 * 1024
-#define RESTORE_STACK_SIZE 16 * MB
-#define RESTORE_MEM_SIZE   16 * MB
+#define RESTORE_STACK_SIZE 5 * MB
+#define RESTORE_MEM_SIZE   5 * MB
 #define RESTORE_TOTAL_SIZE (RESTORE_STACK_SIZE + RESTORE_MEM_SIZE)
 
 // const char service_interp[] __attribute__((section(".interp"))) =
 // "/lib64/ld-linux-x86-64.so.2";
 
-
 int
-__libc_start_main(int (*main)(int,
-                              char **,
-                              char **), int argc, char **argv, void (*init)(
-                    void), void (*fini)(
-                    void), void (*rtld_fini)(void), void *stack_end)
+__libc_start_main(int (*main)(int, char **, char **MAIN_AUXVEC_DECL),
+                             int argc,
+                             char **argv,
+                             __typeof (main) init,
+                             void (*fini) (void),
+                             void (*rtld_fini) (void),
+                             void *stack_end)
 {
   int mtcp_sys_errno;
   char **envp = argv + argc + 1;
@@ -170,8 +197,12 @@ __libc_start_main(int (*main)(int,
   while (1) {}
 }
 
-void
-__libc_csu_init(int argc, char **argv, char **envp) {}
+
+int
+__libc_csu_init(int argc, char **argv, char **envp)
+{
+  return 0;
+}
 
 void
 __libc_csu_fini(void) {}
@@ -196,12 +227,124 @@ memcpy(void *dest, const void *src, size_t n)
   return mtcp_memcpy(dest, src, n);
 }
 
+NO_OPTIMIZE
+char*
+getCkptImageByRank(int rank)
+{
+  int mtcp_sys_errno;
+  MTCP_ASSERT(rinfo.ckptListFd != -1);
+  mtcp_sys_lseek(rinfo.ckptListFd, rank * PATH_MAX, SEEK_SET);
+  mtcp_readfile(rinfo.ckptListFd, rinfo.ckptFileName, PATH_MAX);
+  return rinfo.ckptListFd;
+}
+
+static inline int
+regionContains(const void *haystackStart,
+               const void *haystackEnd,
+               const void *needleStart,
+               const void *needleEnd)
+{
+  return needleStart >= haystackStart && needleEnd <= haystackEnd;
+}
+
+static void
+beforeLoadingGniDriverBlockAddressRanges(char *start1, char *end1,
+	                                 char *start2, char *end2)
+{
+  // FIXME: This needs to be made dynamic.
+  const size_t len1 = end1 - start1;
+  const size_t len2 = end2 - start2;
+
+  void *addr = mmap_fixed_noreplace(start1, len1,
+                             PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                             -1, 0);
+  MTCP_ASSERT(addr == start1);
+  if (len2 > 0) {
+    addr = mmap_fixed_noreplace(start2, len2,
+                         PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                         -1, 0);
+    MTCP_ASSERT(addr == start2);
+  }
+}
+
+static void
+afterLoadingGniDriverUnblockAddressRanges(char *start1, char *end1,
+	                                  char *start2, char *end2)
+{
+  // FIXME: This needs to be made dynamic.
+  const size_t len1 = end1 - start1;
+  const size_t len2 = end2 - start2;
+
+  mtcp_sys_munmap(start1, len1);
+  if (len2 > 0) {
+    mtcp_sys_munmap(start2, len2);
+  }
+}
+
+int reserve_fds_upper_half(int *reserved_fds) {
+  int total_reserved_fds = 0;
+  int tmp_fd = 0;
+    while (tmp_fd < 500) {
+      MTCP_ASSERT((tmp_fd = mtcp_sys_open2("/dev/null",O_RDONLY)) != -1);  
+      reserved_fds[total_reserved_fds]=tmp_fd;
+      total_reserved_fds++;
+    }
+  return total_reserved_fds;
+}
+
+void unreserve_fds_upper_half(int *reserved_fds, int total_reserved_fds) {
+  int tmp_fd = 0;
+    while (--total_reserved_fds >= 0) {
+      MTCP_ASSERT((mtcp_sys_close(reserved_fds[total_reserved_fds])) != -1);  
+    }
+}
+
+
+// FIXME: Many style rules broken.  Code never reviewed by skilled programmer.
+
+NO_OPTIMIZE
+static unsigned long int
+mygetauxval(char **evp, unsigned long int type)
+{ while (*evp++ != NULL) {};
+  Elf64_auxv_t *auxv = (Elf64_auxv_t *)evp;
+  Elf64_auxv_t *p;
+  for (p = auxv; p->a_type != AT_NULL; p++) {
+    if (p->a_type == type)
+       return p->a_un.a_val;
+  }
+  return 0;
+}
+
+NO_OPTIMIZE
+static int
+mysetauxval(char **evp, unsigned long int type, unsigned long int val)
+{ while (*evp++ != NULL) {};
+  Elf64_auxv_t *auxv = (Elf64_auxv_t *)evp;
+  Elf64_auxv_t *p;
+  for (p = auxv; p->a_type != AT_NULL; p++) {
+    if (p->a_type == type) {
+       p->a_un.a_val = val;
+       return 0;
+    }
+  }
+  return -1;
+}
+
+#define PAGESIZE 4096 /* We hardwire this, since we can't make libc calls. */
+// We choose this address based on our observation on CORI that it won't overlap
+// with any other memory segments. We might change this address in the future,
+// for now, it doesn't matters.
+#define vvarStartTmp ((0x40000) - 5*PAGESIZE)
+#define vdsoStartTmp ((0x40000) - 2*PAGESIZE)
+
+
 #define shift argv++; argc--;
 NO_OPTIMIZE
 int
 main(int argc, char *argv[], char **environ)
 {
   char *ckptImage = NULL;
+  char ckptImageNew[512];
   MtcpHeader mtcpHdr;
   int mtcp_sys_errno;
   int simulate = 0;
@@ -289,15 +432,168 @@ main(int argc, char *argv[], char **environ)
       mtcp_printf("Considering '%s' as a ckpt image.\n", argv[0]);
       ckptImage = argv[0];
       break;
+    } else if (runMpiProxy) {
+      // N.B.: The assumption here is that the user provides the `--mpi` flag
+      // followed by a list of checkpoint images
+      break;
     } else {
       MTCP_PRINTF("MTCP Internal Error\n");
       return -1;
     }
   }
 
-  if ((rinfo.fd != -1) ^ (ckptImage == NULL)) {
+  if ((rinfo.fd != -1) ^ (ckptImage == NULL) && !runMpiProxy) {
     MTCP_PRINTF("***MTCP Internal Error\n");
     mtcp_abort();
+  }
+
+  if (runMpiProxy) {
+    // USAGE:  DMTCP_MANA_PAUSE=1 srun -n XXX gdb --args dmtcp_restart ...
+    //   (for DEBUGGING by setting DMTCP_MANA_PAUSE environment variable)
+    // RATIONALE: When using Slurm's srun, dmtcp_restart is a child process
+    //   of slurmstepd.  So, 'gdb --args srun -n XX dmtcp_restart ...' doesn't
+    //   work, since 'dmtcp_restart ...' is fork/exec'ed from slurmstepd.
+    // ALTERNATIVE (tested under Slurm 19.05):
+    //   'srun --input all' should "broadcast stdin to all remote tasks".
+    //   But 'srun --input all -n 1 gdb --args dmtcp_restart ...'
+    //   fails.  GDB starts up, but then exits (due to end-of-stdin??).
+    char **myenvp = environ;
+    while (*myenvp != NULL) {
+      if (mtcp_strstartswith(*myenvp++, "DMTCP_MANA_PAUSE=")) {
+        MTCP_PRINTF("*** PAUSED FOR DEBUGGING: Please do:\n  *** gdb %s %d\n\n",
+                    argv0, mtcp_sys_getpid());
+        MTCP_PRINTF("***     (OR, for one rank only, do:)\n"
+                    "  ***     gdb %s `pgrep -n mtcp_restart`\n\n", argv0);
+        MTCP_PRINTF("*** Then do '(gdb) p dummy=0' to continue debugging.\n\n");
+        volatile int dummy = 1;
+        while (dummy) {};
+        break;
+      }
+    }
+
+    DPRINTF("vdsoStart: %p\n", mygetauxval(environ, AT_SYSINFO_EHDR));
+    // We could have read /proc/self/maps for vdsoStart, etc.  But that code
+    //   is long, and is used to discover many things about the maps.
+    //   By using mygetauxval(), we have a much shorter mechanism now.
+    // If we want to test this, we can add code to do a trial mremap with a page
+    //   before vvar and after vdso, and verify that we get an EFAULT.
+    // In May, 2020, on Cori and elsewhere, vvar is 3 pages and vdso is 2 pages.
+    char *vdsoStart = (char *)mygetauxval(environ, AT_SYSINFO_EHDR);
+    char *vvarStart = vdsoStart - 3 * PAGESIZE;
+    void *rc1 = mtcp_sys_mremap(vvarStart, 3*PAGESIZE, 3*PAGESIZE,
+		                MREMAP_FIXED | MREMAP_MAYMOVE, vvarStartTmp);
+    void *rc2 = mtcp_sys_mremap(vdsoStart, 2*PAGESIZE, 2*PAGESIZE,
+		                MREMAP_FIXED | MREMAP_MAYMOVE, vdsoStartTmp);
+    if (rc2 == MAP_FAILED) { // vdso segment can be one page or two pages.
+      rc2 = mtcp_sys_mremap(vdsoStart, 1*PAGESIZE, 1*PAGESIZE,
+		            MREMAP_FIXED | MREMAP_MAYMOVE, vdsoStartTmp);
+    }
+    if (rc1 == MAP_FAILED || rc2 == MAP_FAILED) {
+      MTCP_PRINTF("mtcp_restart failed: "
+		  "gdb --mpi \"DMTCP_ROOT/bin/mtcp_restart\" to debug.\n");
+    }
+    // Now that we moved vdso/vvar, we need to update the vdso address
+    //   in the auxv vector.  This will be needed when the lower half
+    //   starts up:  initializeLowerHalf() will be called from splitProcess().
+    mysetauxval(environ, AT_SYSINFO_EHDR, vdsoStartTmp);
+  }
+
+  if (runMpiProxy) {
+    // NOTE: We use mtcp_restart's original stack to initialize the lower
+    // half. We need to do this in order to call MPI_Init() in the lower half,
+    // which is required to figure out our rank, and hence, figure out which
+    // checkpoint image to open for memory restoration.
+    // The other assumption here is that we can only handle uncompressed
+    // checkpoint images.
+
+    // This creates the lower half and copies the bits to this address space
+    splitProcess(argv0, environ);
+
+    // Reserve first 500 file descriptors for the Upper-half
+    int reserved_fds[500];
+    int total_reserved_fds;
+    total_reserved_fds = reserve_fds_upper_half(reserved_fds);
+
+    // Refer to "blocked memory" in MANA Plugin Documentation for the addresses
+#ifdef GNI
+# define GB (uint64_t)(1024 * 1024 * 1024)
+    // FIXME:  Rewrite this logic more carefully.
+    char *start1, *start2, *end1, *end2;
+    if (rinfo.maxLibsEnd + 1 * GB < rinfo.minHighMemStart /* end of stack of upper half */) {
+      start1 = rinfo.minLibsStart;    // first lib (ld.so) of upper half
+      // lh_info.memRange is the memory region for the mmaps of the lower half.
+      // Apparently lh_info.memRange is a region between 1 GB and 2 GB below
+      //   the end of stack in the lower half.
+      // One gigabyte below those mmaps of the lower half, we are creating space
+      //   for the GNI driver data, to be created when the GNI library runs.
+      // This says that we have to reserve only up to the mtcp_restart stack.
+      end1 = lh_info.memRange.start - 1 * GB;
+      // start2 == end2:  So, this will not be used.
+      start2 = 0;
+      end2 = start2;
+# ifdef MANA_USE_LH_FIXED_ADDRESS
+    } else {
+      // On standard Ubuntu/CentOS libs are mmap'ed downward in memory.
+      // Allow an extra 1 GB for future upper-half libs and mmaps to be loaded.
+      // FIXME:  Will the GNI driver data be allocated below start1?
+      //         If so, fix this to block more than a 1 GB address range.
+      //         The GNI driver data is only used by Cray GNI.
+      //         But lower-half MPI_Init may call additional mmap's not
+      //           controlled by us.
+      //         Check this logic.
+      // NOTE:   setLhMemRange (lh_info.memRange: future mmap's of lower half)
+      //           was chosen to be in safe memory region
+      // NOTE:   When we mmap start1..end1, we will overwrite the text and
+      //         data segments of ld.so belonging to mtcp_restart.  But
+      //         mtcp_restart is statically linked, and doesn't need it.
+      Area heap_area;
+      MTCP_ASSERT(getMappedArea(&heap_area, "[heap]") == 1);
+      // FIXME:  choose higher of this
+      //           and lh_info.memRange.end; // 0x2aab00000000
+      start1 = heap_area.endAddr;
+      // FIXME:  choose lower of this and highMemStart
+      //        and make sure it doesn't intersect with lh_info.memRange
+      Area stack_area;
+      MTCP_ASSERT(getMappedArea(&stack_area, "[stack]") == 1);
+      end1 = stack_area.endAddr - 4 * GB;
+      // end1 = highMemStart - 4 * GB;
+      start2 = 0;
+      end2 = start2;
+# else
+    } else {
+      MTCP_PRINTF("Upper half high end of libs memory too close to stack.\n");
+      mtcp_abort();
+# endif
+    }
+#else
+    // ***** These constants are hardwired for Cori in May, 2020 *****
+    // *****   DELETE THIS WHEN NO LONGER NEEDED FOR DEBUGGING   *****
+    // The dynamic values of start1, end1 above are preferred to this.
+    void *start1 = (const void*)0x2aaaaaaaf000; // End of vdso
+    //  const void *end1 = (const void*)0x2aaaaaaf8000;
+    //  const size_t len1 = end1 - start1;
+    //  const void *start2 = (const void*)0x2aaaaab1b000; // Start of upper half
+    void *end1 = lh_info.memRange.start; //Start of lower half memory
+    size_t len1 = end1 - start1;
+    char *start2 = 0;
+    char *end2 = start2;
+#endif
+    typedef int (*getRankFptr_t)(void);
+    int rank = -1;
+    beforeLoadingGniDriverBlockAddressRanges(start1, end1, start2, end2);
+    JUMP_TO_LOWER_HALF(lh_info.fsaddr);
+    // MPI_Init is called here. GNI memory areas will be loaded by MPI_Init.
+    rank = ((getRankFptr_t)lh_info.getRankFptr)();
+    RETURN_TO_UPPER_HALF();
+
+    afterLoadingGniDriverUnblockAddressRanges(start1, end1, start2, end2);
+    unreserve_fds_upper_half(reserved_fds,total_reserved_fds);
+
+    ckptImage = getCkptImageByRank(rank);
+
+    MTCP_PRINTF("[Rank: %d] Choosing ckpt image: %s\n", rank, ckptImage);
+    //ckptImage = getCkptImageByRank(rank, argv);
+    //MTCP_PRINTF("[Rank: %d] Choosing ckpt image: %s\n", rank, ckptImage);
   }
 
 #ifdef TIMING
@@ -354,7 +650,7 @@ main(int argc, char *argv[], char **environ)
 
   restore_brk(rinfo.saved_brk, rinfo.restore_addr,
               rinfo.restore_addr + rinfo.restore_size);
-
+  getTextAddr(&rinfo.text_addr, &rinfo.text_size);
   if (hasOverlappingMapping(rinfo.restore_addr, rinfo.restore_size)) {
     MTCP_PRINTF("*** Not Implemented.\n\n");
     mtcp_abort();
@@ -430,7 +726,7 @@ restore_brk(VA saved_brk, VA restore_begin, VA restore_end)
               new_brk, saved_brk);
     } else {
       if (new_brk == current_brk) {
-        MTCP_PRINTF("error: new/current break (%p) != saved break (%p)\n",
+        MTCP_PRINTF("warning: new/current break (%p) != saved break (%p)\n",
                     current_brk, saved_brk);
       } else {
         MTCP_PRINTF("error: new break (%p) != current break (%p)\n",
@@ -474,6 +770,7 @@ clear_icache(void *beg, void *end)
 
     /* Flush data cache to point of unification, one line at a time. */
     addr = ALIGN_BACKWARD(beg_uint, dcache_line_size);
+if ((unsigned long)addr > (unsigned long)beg_uint) { while(1); }
     do {
         __asm__ __volatile__("dc cvau, %0" : : "r"(addr) : "memory");
         addr += dcache_line_size;
@@ -502,51 +799,136 @@ NO_OPTIMIZE
 static void
 restart_fast_path()
 {
-#ifdef LOGGING
-  int mtcp_sys_errno;  // for sake of DPRINTF()
-#endif
+  int mtcp_sys_errno;
+  void *addr = mmap_fixed_noreplace(rinfo.restore_addr, rinfo.restore_size,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+  if (addr == MAP_FAILED) {
+    MTCP_PRINTF("mmap failed with error; errno: %d\n", mtcp_sys_errno);
+    mtcp_abort();
+  }
+
+  size_t offset = (char *)&restorememoryareas - rinfo.text_addr;
+  rinfo.restorememoryareas_fptr = (fnptr_t)(rinfo.restore_addr + offset);
 
   /* For __arm__ and __aarch64__ will need to invalidate cache after this.
    */
-  remapMtcpRestartToReservedArea(&rinfo);
+  mtcp_memcpy(rinfo.restore_addr, rinfo.text_addr, rinfo.text_size);
+  mtcp_memcpy(rinfo.restore_addr + rinfo.text_size, &rinfo, sizeof(rinfo));
+  void *stack_ptr = rinfo.restore_addr + rinfo.restore_size - MB;
 
-  // Copy over old stack to new location;
-  mtcp_memcpy(rinfo.new_stack_addr, rinfo.old_stack_addr, rinfo.old_stack_size);
+  // The kernel call, __ARM_NR_cacheflush is avail. for __arm__, which
+  //   requires kernel privilege to flush cache.  For __aarch64__  user-space suffices
+  //   (and glibc clear_cache() is not available in most distros)
+/*
+  // Not avail. for __aarch64__, but should try this for __arm__:
+  mtcp_sys_errno = 0;
+  int rc1 = mtcp_sys_kernel_cacheflush(rinfo.restore_addr, rinfo.restore_addr + rinfo.text_size, 0);
+  if (rc1 !=0) { MTCP_PRINTF("mtcp_sys_kernel_cacheflush failed; errno: %d\n", mtcp_sys_errno); }
+  mtcp_sys_errno = 0;
+  int rc2 = mtcp_sys_kernel_cacheflush(rinfo.restore_addr + rinfo.text_size,
+                                       rinfo.restore_addr + rinfo.text_size + sizeof(rinfo), 0);
+  if (rc2 !=0) { MTCP_PRINTF("mtcp_sys_kernel_cacheflush failed\n"); }
+  mtcp_sys_mprotect(rinfo.restore_addr, rinfo.restore_size,
+                             PROT_READ | PROT_EXEC);
+*/
+
+#if defined(__INTEL_COMPILER) && defined(__x86_64__)
+  asm volatile ("mfence" ::: "memory"); // memfence() defined in dmtcpplugin.cpp
+  asm volatile (CLEAN_FOR_64_BIT(mov %0, %%esp; )
+                CLEAN_FOR_64_BIT(xor %%ebp, %%ebp)
+                  : : "g" (stack_ptr) : "memory");
+
+  // This is copied from gcc assembly output for:
+  // rinfo.restorememoryareas_fptr(&rinfo);
+  // Intel icc-13.1.3 output uses register rbp here.  It's no longer available.
+  asm volatile(
+   // 112 = offsetof(RestoreInfo, rinfo.restorememoryareas_fptr)
+   // NOTE: Update the offset when adding fields to the RestoreInfo struct
+   "movq    112+rinfo(%%rip), %%rdx;" /* rinfo.restorememoryareas_fptr */
+   "leaq    rinfo(%%rip), %%rdi;"    /* &rinfo */
+   "movl    $0, %%eax;"
+   "call    *%%rdx"
+   : : );
+  /* NOTREACHED */
+#endif /* if defined(__INTEL_COMPILER) && defined(__x86_64__) */
+
+#if defined(__arm__) || defined(__aarch64__)
+# if defined(__aarch64__)
+  // We would like to use the GCC builtin, __sync_synchronize()
+  //  but it doesn't appear to be portable to arm/aarch64 as of Aug., 2018
+  RMB; WMB; IMB;
+  // The call to clear_icache() wasn't effective:
+  //   clear_icache(rinfo.restore_addr, rinfo.restore_addr + rinfo.restore_size);
+  // So, now we're using the loop to read memory into dummy, below, as a hack.
+  // Apparently, this assembly instruction for "invalidate cache" requires
+  //   kernel privilege:
+  //   asm volatile (".arch armv8.1-a\n\t ic iallu\n\t" : : : "memory");
+  // This logic is a hack to make sure that the cache recognizes new mmap region
+  // Why can't gcc or glibc provide a working 'man 2 cacheflush' to correspond
+  //   to the man page in Ubuntu 16.04?  (Or maybe clear_cache()?)
+  char dummy;
+  for (char *ptr = rinfo.restore_addr; ptr < rinfo.restore_addr + rinfo.restore_size; ptr++) {
+    dummy = dummy ^ *ptr;
+  }
+  asm volatile("dsb ish" : : : "memory");
+  RMB; WMB; IMB;
+# else /* else if 0 */
+  // FIXME:  Test if this delay loop is no longer needed for __arm__.
+  //     We should be able to replace this by:
+  //     mtcp_sys_kernel_cacheflush(rinfo.restore_addr,
+  //                                rinfo.restore_addr + rinfo.text_size, 0);
+  //     If that works, then delete this delay loop code.
+
+  /* This delay loop was required for:
+   *    ARM v7 (rev 3, v71), SAMSUNG EXYNOS5 (Flattened Device Tree)
+   *    gcc-4.8.1 (Ubuntu pre-release for 14.04) ; Linux 3.13.0+ #54
+   */
+  MTCP_PRINTF("*** WARNING: %s:%d: Delay loop on restart for older ARM CPUs\n"
+              "*** Consider removing this line for newer CPUs.\n",
+              __FILE__, __LINE__);
+  { int x = 10000000;
+    int y = 1000000000;
+    for (; x > 0; x--) {
+      for (; y > 0; y--) {}
+    }
+  }
+# endif /* if defined(__aarch64__) */
+#endif /* if defined(__arm__) || defined(__aarch64__) */
 
   DPRINTF("We have copied mtcp_restart to higher address.  We will now\n"
           "    jump into a copy of restorememoryareas().\n");
 
-  // Read the current value of sp and bp/fp registers and subtract the
-  // stack_offset to compute the new sp and bp values. We have already copied
-  // all the bits from old stack to the new one and so any one referring to
-  // stack data using sp/bp should be fine.
-  // NOTE: changing the value of bp/fp register is optional and only useful for
-  // doing a return from this function or to access any local variables. Since
-  // we don't use any local variables from here on, we can ignore bp/fp
-  // registers.
-  // NOTE: 32-bit ARM doesn't have an fp register.
-
 #if defined(__i386__) || defined(__x86_64__)
-  asm volatile ("mfence" ::: "memory");
+  asm volatile (CLEAN_FOR_64_BIT(mov %0, %%esp; )
+# ifndef __clang__
 
-  asm volatile (CLEAN_FOR_64_BIT(sub %0, %%esp; )
-                CLEAN_FOR_64_BIT(sub %0, %%ebp; )
-                : : "r" (rinfo.stack_offset) : "memory");
+                /* This next assembly language confuses gdb.  Set a future
+                   future breakpoint, or attach after this point, if in gdb.
+                   It's here to force a hard error early, in case of a bug.*/
+                CLEAN_FOR_64_BIT(xor %%ebp, %%ebp)
+# else /* ifndef __clang__ */
 
+                /* Even with -O0, clang-3.4 uses register ebp after this
+                   statement. */
+# endif /* ifndef __clang__ */
+                : : "g" (stack_ptr) : "memory");
 #elif defined(__arm__)
-  asm volatile ("sub sp, sp, %0"
-                : : "r" (rinfo.stack_offset) : "memory");
+  asm volatile ("mov sp,%0\n\t"
+                : : "r" (stack_ptr) : "memory");
 
+  /* If we're going to have an error, force a hard error early, to debug. */
+  asm volatile ("mov fp,#0\n\tmov ip,#0\n\tmov lr,#0" : :);
 #elif defined(__aarch64__)
-  // Use x29 instead of fp because GCC's inline assembler does not recognize fp.
-  asm volatile ("sub sp, sp, %0\n\t"
-                "sub x29, x29, %0"
-                : : "r" (rinfo.stack_offset) : "memory");
+  asm volatile ("mov sp,%0\n\t"
+                : : "r" (stack_ptr) : "memory");
 
+  /* If we're going to have an error, force a hard error early, to debug. */
+
+  // FIXME:  Add a hard error here in assembly.
 #else /* if defined(__i386__) || defined(__x86_64__) */
-
 # error "assembly instruction not translated"
-
 #endif /* if defined(__i386__) || defined(__x86_64__) */
 
   /* IMPORTANT:  We just changed to a new stack.  The call frame for this
@@ -555,7 +937,7 @@ restart_fast_path()
    * We call restorememoryareas_fptr(), which points to the copy of the
    * function in higher memory.  We will be unmapping the original fnc.
    */
-  rinfo.restorememoryareas_fptr(&rinfo);
+  rinfo.restorememoryareas_fptr(&rinfo, &lh_info);
 
   /* NOTREACHED */
 }
@@ -565,7 +947,7 @@ NO_OPTIMIZE
 static void
 restart_slow_path()
 {
-  restorememoryareas(&rinfo);
+  restorememoryareas(&rinfo, &lh_info);
 }
 
 // Used by util/readdmtcp.sh
@@ -631,7 +1013,7 @@ mtcp_simulateread(int fd, MtcpHeader *mtcpHdr)
 
 NO_OPTIMIZE
 static void
-restorememoryareas(RestoreInfo *rinfo_ptr)
+restorememoryareas(RestoreInfo *rinfo_ptr, LowerHalfInfo_t *linfo_ptr)
 {
   int mtcp_sys_errno;
 
@@ -644,22 +1026,27 @@ restorememoryareas(RestoreInfo *rinfo_ptr)
 
   if (rinfo_ptr->use_gdb) {
     MTCP_PRINTF("Called with --use-gdb.  A useful command is:\n"
-                "    (gdb) info proc mapping\n"
-                "    (gdb) add-symbol-file ../../bin/mtcp_restart %p\n",
-                rinfo_ptr->mtcp_restart_text_addr);
-
+                "    (gdb) info proc mapping\n");
+    if (rinfo_ptr->text_offset != -1) {
+      MTCP_PRINTF("Called with --text-offset 0x%x.  A useful command is:\n"
+                  "(gdb) add-symbol-file ../../bin/mtcp_restart %p\n",
+                  rinfo_ptr->text_offset,
+                  rinfo_ptr->restore_addr + rinfo_ptr->text_offset);
 #if defined(__i386__) || defined(__x86_64__)
-    asm volatile ("int3"); // Do breakpoint; send SIGTRAP, caught by gdb
+      asm volatile ("int3"); // Do breakpoint; send SIGTRAP, caught by gdb
 #else /* if defined(__i386__) || defined(__x86_64__) */
-    MTCP_PRINTF(
-      "IN GDB: interrupt (^C); add-symbol-file ...; (gdb) print x=0\n");
-    { int x = 1; while (x) {}
-    }                         // Stop execution for user to type command.
+      MTCP_PRINTF(
+        "IN GDB: interrupt (^C); add-symbol-file ...; (gdb) print x=0\n");
+      { int x = 1; while (x) {}
+      }                         // Stop execution for user to type command.
 #endif /* if defined(__i386__) || defined(__x86_64__) */
+    }
   }
 
   RestoreInfo restore_info;
+  LowerHalfInfo_t lh_info;
   mtcp_memcpy(&restore_info, rinfo_ptr, sizeof(restore_info));
+  mtcp_memcpy(&lh_info, linfo_ptr, sizeof(lh_info));
   if (rinfo_ptr->saved_brk != NULL) {
     // Now, we can do the pending mtcp_sys_brk(rinfo.saved_brk).
     // It's now safe to do this, even though it can munmap memory holding rinfo.
@@ -686,7 +1073,7 @@ restorememoryareas(RestoreInfo *rinfo_ptr)
    *   the old vdso with the new one (using mremap).
    *   Similarly for vvar.
    */
-  unmap_memory_areas_and_restore_vdso(&restore_info);
+  unmap_memory_areas_and_restore_vdso(&restore_info, &lh_info);
   /* Restore memory areas */
   DPRINTF("restoring memory areas\n");
   readmemoryareas(restore_info.fd, restore_info.endOfStack);
@@ -722,7 +1109,7 @@ restorememoryareas(RestoreInfo *rinfo_ptr)
       "You should now be in 'ThreadList::postRestart()'\n"
       "  (gdb) list\n"
       "  (gdb) p dummy = 0\n"
-      "  # In some recent Linuxes/glibc/gdb, you may also need to do:\n"
+      "  # Since Linux 3.10 (prctl:PR_SET_MM), you will also need to do:\n"
       "  (gdb) source DMTCP_ROOT/util/gdb-add-symbol-files-all\n"
       "  (gdb) add-symbol-files-all\n",
       mtcp_sys_getpid()
@@ -732,15 +1119,57 @@ restorememoryareas(RestoreInfo *rinfo_ptr)
   // NOTREACHED
 }
 
+static int
+skip_lh_memory_region_ckpting(const Area *area, LowerHalfInfo_t *lh_info)
+{
+  static MmapInfo_t *g_list = NULL;
+  static int g_numMmaps = 0;
+  int i = 0;
+
+  getMmappedList_t fnc = (getMmappedList_t)lh_info->getMmappedListFptr;
+  if (fnc) {
+    g_list = fnc(&g_numMmaps);
+  }
+  if (area->addr == lh_info->startText ||
+      mtcp_strstr(area->name, "/dev/zero") ||
+      mtcp_strstr(area->name, "/dev/kgni") ||
+      mtcp_strstr(area->name, "/dev/xpmem") ||
+      mtcp_strstr(area->name, "/dev/shm") ||
+      mtcp_strstr(area->name, "/SYS") ||
+      area->addr == lh_info->startData) {
+    return 1;
+  }
+  if (!g_list) return 0;
+  for (i = 0; i < g_numMmaps; i++) {
+    void *lhMmapStart = g_list[i].addr;
+    void *lhMmapEnd = (VA)g_list[i].addr + g_list[i].len;
+    if (!g_list[i].unmapped &&
+        regionContains(lhMmapStart, lhMmapEnd, area->addr, area->endAddr)) {
+      return 1;
+    } else if (!g_list[i].unmapped &&
+               regionContains(area->addr, area->endAddr,
+                              lhMmapStart, lhMmapEnd)) {
+    }
+  }
+  return 0;
+}
+
 NO_OPTIMIZE
 static void
-unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
+unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo, LowerHalfInfo_t *lh_info)
 {
   /* Unmap everything except this image, vdso, vvar and vsyscall. */
   int mtcp_sys_errno;
   Area area;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 10, 0) 
   VA vdsoStart = NULL;
   VA vdsoEnd = NULL;
+#else
+  // This Linux kernel does not re-label vdso/vvar after calling mremap on it.
+  // So, lower down, we will fail to find vdeso in /proc/self/maps
+  VA vdsoStart = (VA)vdsoStartTmp;
+  VA vdsoEnd = (VA)(vdsoStartTmp + 2*PAGESIZE);
+#endif
   VA vvarStart = NULL;
   VA vvarEnd = NULL;
 
@@ -776,6 +1205,14 @@ unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
       // Do not unmap vsyscall.
     } else if (mtcp_strcmp(area.name, "[vectors]") == 0) {
       // Do not unmap vectors.  (used in Linux 3.10 on __arm__)
+    } else if (mtcp_strstr(area.name, "/dev/shm/mpich")) {
+      // Do not unmap shm region created by MPI
+      // FIXME: It's possible that this region conflicts with some region
+      //        in the checkpoint image.
+    } else if (skip_lh_memory_region_ckpting(&area, lh_info)) {
+      // Do not unmap lower half
+      DPRINTF("Skipping lower half memory section: %p-%p\n",
+              area.addr, area.endAddr);
     } else if (area.size > 0) {
 #ifndef NO_REMAP
       DPRINTF("***INFO: munmapping (%p..%p)\n", area.addr, area.endAddr);
@@ -833,7 +1270,7 @@ unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
                      rinfo->vvarStart, rinfo->vvarEnd - rinfo->vvarStart)
 #else
       // We will move vvar first, if original vvar doesn't overlap with
-      // current vdso,  After that, it should be possible to move vdso to its
+      // current vdso.  After that, it should be possible to move vdso to its
       // original position.
       doAreasOverlap(rinfo->vvarStart, vvarEnd - vvarStart,
                      vdsoStart, vdsoEnd - vdsoStart)
@@ -897,7 +1334,7 @@ unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
       mtcp_abort();
     }
 #if defined(__i386__)
-    // FIXME: For clarity of code, move this i386-specific code toa function.
+    // FIXME: For clarity of code, move this i386-specific code to a function.
     // In commit dec2c26c1eb13eb1c12edfdc9e8e811e4cc0e3c2 , the mremap
     // code above was added, and then caused a segfault on restart for
     // __i386__ in CentOS 7.  In that case ENABLE_VDSO_CHECK was not defined.
@@ -1007,8 +1444,8 @@ read_one_memory_area(int fd, VA endOfStack)
    * prepareMtcpHeader() in threadlist.cpp and ProcessInfo::growStack()
    * in processinfo.cpp.
    */
-  if ((area.name[0] && area.name[0] != '/' && mtcp_strstr(area.name, "stack"))
-      || (area.endAddr == endOfStack)) {
+  if (area.name[0] && (mtcp_strstr(area.name, "[stack]") ||
+                       (area.endAddr == endOfStack))) {
     area.flags = area.flags | MAP_GROWSDOWN;
     DPRINTF("Detected stack area. End of stack (%p); Area end address (%p)\n",
             endOfStack, area.endAddr);
@@ -1028,12 +1465,12 @@ read_one_memory_area(int fd, VA endOfStack)
   if ((area.properties & DMTCP_ZERO_PAGE) != 0) {
     DPRINTF("restoring non-rwx anonymous area, %p bytes at %p\n",
             area.size, area.addr);
-    mmappedat = mtcp_sys_mmap(area.addr, area.size,
+    mmappedat = mmap_fixed_noreplace(area.addr, area.size,
                               area.prot,
                               area.flags | MAP_FIXED, -1, 0);
 
     if (mmappedat != area.addr) {
-      DPRINTF("error %d mapping %p bytes at %p\n",
+      MTCP_PRINTF("error %d mapping %p bytes at %p\n",
               mtcp_sys_errno, area.size, area.addr);
       mtcp_abort();
     }
@@ -1100,8 +1537,13 @@ read_one_memory_area(int fd, VA endOfStack)
      * are valid.  Can we unmap vdso and vsyscall in Linux?  Used to use
      * mtcp_safemmap here to check for address conflicts.
      */
-    mmappedat = mtcp_sys_mmap(area.addr, area.size, area.prot | PROT_WRITE,
-                              area.flags, imagefd, area.offset);
+    if (area.hugepages) {
+      area.flags |= MAP_HUGETLB;
+    }
+
+    mmappedat = mmap_fixed_noreplace(area.addr, area.size,
+	                             area.prot | PROT_WRITE,
+	                             area.flags, imagefd, area.offset);
 
     if (mmappedat == MAP_FAILED) {
       DPRINTF("error %d mapping %p bytes at %p\n",
@@ -1188,7 +1630,7 @@ adjust_for_smaller_file_size(Area *area, int fd)
     DPRINTF("For %s, current size (%ld) smaller than original (%ld).\n"
             "mmap()'ng the difference as anonymous.\n",
             area->name, curr_size, area->size);
-    VA mmappedat = mtcp_sys_mmap(anon_start_addr, anon_area_size,
+    VA mmappedat = mmap_fixed_noreplace(anon_start_addr, anon_area_size,
                                  area->prot | PROT_WRITE,
                                  MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
                                  -1, 0);
@@ -1240,10 +1682,9 @@ hasOverlappingMapping(VA addr, size_t size)
   return ret;
 }
 
-/* This uses MREMAP_FIXED | MREMAP_MAYMOVE to move a memory segment.
- * Note that we need 'MREMAP_MAYMOVE'.  With only 'MREMAP_FIXED', the
- * kernel can overwrite an existing memory region.
- */
+// XXX: Define this on systems with older LD
+#define OLDER_LD
+
 NO_OPTIMIZE
 static int
 mremap_move(void *dest, void *src, size_t size) {
@@ -1252,7 +1693,7 @@ mremap_move(void *dest, void *src, size_t size) {
     return 0; // Success
   }
   void *rc = mtcp_sys_mremap(src, size, size, MREMAP_FIXED | MREMAP_MAYMOVE,
-                               dest);
+                             dest);
   if (rc == dest) {
     return 0; // Success
   } else if (rc == MAP_FAILED) {
@@ -1260,152 +1701,68 @@ mremap_move(void *dest, void *src, size_t size) {
                 mtcp_sys_errno);
     return -1; // Error
   } else {
-    // Else 'MREMAP_MAYMOVE' forced the remap to the wrong location.  So, the
-    // memory was moved to the wrong desgination.  Undo the move, and return -1.
+    // We failed to move the memory to 'dest'.  Undo it.
     mremap_move(src, rc, size);
     return -1; // Error
   }
 }
 
-// This is the entrypoint to the binary. We'll need it for adding symbol file.
-int _start();
-
 NO_OPTIMIZE
 static void
-remapMtcpRestartToReservedArea(RestoreInfo *rinfo)
+getTextAddr(VA *text_addr, size_t *size)
 {
   int mtcp_sys_errno;
-
-  const size_t MAX_MTCP_RESTART_MEM_REGIONS = 16;
-
-  Area mem_regions[MAX_MTCP_RESTART_MEM_REGIONS];
-
-  size_t num_regions = 0;
-
-  // First figure out mtcp_restart memory regions.
+  Area area;
+  VA this_fn = (VA)&getTextAddr;
   int mapsfd = mtcp_sys_open2("/proc/self/maps", O_RDONLY);
+#ifndef OLDER_LD
+  size_t sz = 0;
+#endif // ifndef OLDER_LD
+
   if (mapsfd < 0) {
     MTCP_PRINTF("error opening /proc/self/maps: errno: %d\n", mtcp_sys_errno);
     mtcp_abort();
   }
 
-  Area area;
   while (mtcp_readmapsline(mapsfd, &area)) {
     if ((mtcp_strendswith(area.name, BINARY_NAME) ||
-         mtcp_strendswith(area.name, BINARY_NAME_M32))) {
-      MTCP_ASSERT(num_regions < MAX_MTCP_RESTART_MEM_REGIONS);
-      mem_regions[num_regions++] = area;
-    }
-
-    // Also compute the stack location.
-    if (area.addr < (VA) &area && area.endAddr > (VA) &area) {
-      // We've found stack.
-      rinfo->old_stack_addr = area.addr;
-      rinfo->old_stack_size = area.size;
-    }
-  }
-
-  mtcp_sys_close(mapsfd);
-
-  size_t restore_region_offset = rinfo->restore_addr - mem_regions[0].addr;
-
-  // TODO: _start can sometimes be different than text_offset. The foolproof
-  // method would be to read the elf headers for the mtcp_restart binary and
-  // compute text offset from there.
-  size_t entrypoint_offset = (VA)&_start - (VA) mem_regions[0].addr;
-  rinfo->mtcp_restart_text_addr = rinfo->restore_addr + entrypoint_offset;
-
-  // Make sure we can fit all mtcp_restart regions in the restore area.
-  MTCP_ASSERT(mem_regions[num_regions - 1].endAddr - mem_regions[0].addr <=
-                rinfo->restore_size);
-
-  // Now remap mtcp_restart at the restore location. Note that for memory
-  // regions with write permissions, we copy over the bits from the original
-  // location.
-  int mtcp_restart_fd = mtcp_sys_open2("/proc/self/exe", O_RDONLY);
-  if (mtcp_restart_fd < 0) {
-    MTCP_PRINTF("error opening /proc/self/exe: errno: %d\n", mtcp_sys_errno);
-    mtcp_abort();
-  }
-
-  size_t i;
-  for (i = 0; i < num_regions; i++) {
-    void *addr = mtcp_sys_mmap(mem_regions[i].addr + restore_region_offset,
-                               mem_regions[i].size,
-                               mem_regions[i].prot,
-                               MAP_PRIVATE | MAP_FIXED,
-                               mtcp_restart_fd,
-                               mem_regions[i].offset);
-
-    if (addr == MAP_FAILED) {
-      MTCP_PRINTF("mmap failed with error; errno: %d\n", mtcp_sys_errno);
-      mtcp_abort();
-    }
-
-    // This probably is some memory that was initialized by the loader; let's
-    // copy over the bits.
-    if (mem_regions[i].prot & PROT_WRITE) {
-      mtcp_memcpy(addr, mem_regions[i].addr, mem_regions[i].size);
-    }
-  }
-
-  // Create a guard page without read permissions and use the remaining region
-  // for the stack.
-
-  VA guard_page =
-    mem_regions[num_regions - 1].endAddr + restore_region_offset;
-
-  MTCP_ASSERT(mtcp_sys_mmap(guard_page,
-                            MTCP_PAGE_SIZE,
-                            PROT_NONE,
-                            MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
-                            -1,
-                            0) == guard_page);
-  MTCP_ASSERT(guard_page != MAP_FAILED);
-
-  VA guard_page_end_addr = guard_page + MTCP_PAGE_SIZE;
-
-  size_t remaining_restore_area =
-    rinfo->restore_addr + rinfo->restore_size - guard_page_end_addr;
-
-#ifdef WSL
-  // FIXME:  The assert below used to fail on WSL.  (Still a work in progress.)
-  //   NOTE that PR #774 raises the following also in src/processinfo.h
-  //     #define RESTORE_STACK_SIZE 16 * MB
-  //     #define RESTORE_MEM_SIZE   16 * MB
-  //   The new values seem to allow the assert below to pass now on WSL.
-  //   Maybe this must correspond between processinfo.h and mtcp_restart.c.
-  //   Maybe it must be a multiple of 2 MB to support HUGEPAGES for WSL ???
-  //   Maybe WSL needs a larger stack, since they don't support MAP_GROWSDOWN
-  // These debugging prints were to catch a failed asserg when
-  //   processinfo.h was set to only 5 MB earlier.  Let's see if the
-  //   assert fails in the future on WSL.  (work in progress)
-  // DPRINTF("remaining_restore_area: %x\na", remaining_restore_area);
-  // DPRINTF("rinfo->old_stack_size: %x\na", rinfo->old_stack_size);
-  // REMOVE ALL OF THESE COMMENTS WHEN THIS CODE IS MATURE.
+         mtcp_strendswith(area.name, BINARY_NAME_M32)) &&
+#ifdef OLDER_LD
+        (area.prot & PROT_EXEC) &&
+#else
+        (area.prot & PROT_EXEC || area.prot & PROT_READ)) {
 #endif
-  MTCP_ASSERT(remaining_restore_area >= rinfo->old_stack_size);
 
-  void *new_stack_end_addr = rinfo->restore_addr + rinfo->restore_size;
-  void *new_stack_start_addr = new_stack_end_addr - rinfo->old_stack_size;
-
-  rinfo->new_stack_addr =
-    mtcp_sys_mmap(new_stack_start_addr,
-                  rinfo->old_stack_size,
-                  PROT_READ | PROT_WRITE,
-                  MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
-                  -1,
-                  0);
-  MTCP_ASSERT(rinfo->new_stack_addr != MAP_FAILED);
-
-  rinfo->stack_offset = rinfo->old_stack_addr - rinfo->new_stack_addr;
-
-  rinfo->restorememoryareas_fptr =
-    (fnptr_t)(&restorememoryareas + restore_region_offset);
-
-  DPRINTF("For debugging:\n"
-          "    (gdb) add-symbol-file ../../bin/mtcp_restart %p\n",
-          rinfo->mtcp_restart_text_addr);
+        /* On ARM/Ubuntu 14.04, mtcp_restart is mapped twice with RWX
+         * permissions. Not sure why? Here is an example:
+         *
+         * 00008000-00010000 r-xp 00000000 b3:02 144874     .../bin/mtcp_restart
+         * 00017000-00019000 rwxp 00007000 b3:02 144874     .../bin/mtcp_restart
+         * befdf000-bf000000 rwxp 00000000 00:00 0          [stack]
+         * ffff0000-ffff1000 r-xp 00000000 00:00 0          [vectors]
+         */
+#ifdef OLDER_LD
+        (area.addr < this_fn && (area.addr + area.size) > this_fn)) {
+      *text_addr = area.addr;
+      *size = area.size;
+      break;
+#else
+      if (area.addr < this_fn && !(area.prot & PROT_EXEC)) {
+        *text_addr = area.addr;
+        sz += area.size;
+      } else if (area.addr < this_fn && (area.addr + area.size) > this_fn) {
+        sz += area.size;
+      } else if (area.addr > this_fn && area.prot & PROT_READ) {
+        sz += area.size;
+        break;
+      }
+#endif // ifdef OLDER_LD
+    }
+  }
+#ifndef OLDER_LD
+  *size = sz;
+#endif // ifndef OLDER_LD
+  mtcp_sys_close(mapsfd);
 }
 
 // gcc can generate calls to these.
@@ -1481,7 +1838,7 @@ static void mmapfile(int fd, void *buf, size_t size, int prot, int flags)
   int rc;
 
   /* Use mmap for this portion of checkpoint image. */
-  addr = mtcp_sys_mmap(buf, size, prot, flags,
+  addr = mmap_fixed_noreplace(buf, size, prot, flags,
                        fd, mtcp_sys_lseek(fd, 0, SEEK_CUR));
   if (addr != buf) {
     if (addr == MAP_FAILED) {

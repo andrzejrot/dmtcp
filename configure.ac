@@ -5,8 +5,7 @@ AC_INIT([DMTCP],
         [http://dmtcp.sourceforge.net])
 
 AC_PREREQ([2.60])
-# TODO(kapil): Add 'subdir-objects after automake 1.16 has been released.
-AM_INIT_AUTOMAKE([foreign])
+AM_INIT_AUTOMAKE([1.13 foreign subdir-objects])
 AM_MAINTAINER_MODE
 AC_CANONICAL_HOST
 AC_PROG_INSTALL
@@ -48,6 +47,10 @@ AC_CONFIG_FILES([Makefile \
                  test/autotest_config.py \
                  test/plugin/Makefile])
 #AC_CONFIG_FILES([test/credentials/Makefile])
+
+if test -e contrib/mpi-proxy-split/Makefile_config.in; then
+  AC_CONFIG_FILES([contrib/mpi-proxy-split/Makefile_config])
+fi
 
 #AC_CONFIG_SUBDIRS([dmtcp])
 
